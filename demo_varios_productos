@@ -1,0 +1,341 @@
+#include <Arduino.h>
+#include <esp_task_wdt.h>
+#include <LedControl.h>
+#include <Preferences.h>
+
+// Pines MAX7219
+#define DIN_PIN   23
+#define CS_PIN     5
+#define CLK_PIN   18
+
+// Pines 74HC595
+#define HC595_ST  25  
+#define HC595_SH  13  
+#define HC595_DS  26  
+
+// Bits 74HC595
+#define Q0_BLOCK_COIN  0
+#define Q1_LED_ROJO    1
+#define Q3_LED_VERDE   3
+#define Q4_LED_AMBAR   4
+
+#define Q0_EV_PROD1    (8 + 0)
+
+// Monedero y Botones
+#define COIN_PIN       14
+#define BTN_PROD1      32
+#define BOMBA_PROD1    16
+
+// Pulsadores de configuración
+#define OK_BTN         2
+#define ADD_BTN        4
+#define MINUS_BTN      15
+
+#define WDT_TIMEOUT_MS 5000
+#define DEBOUNCE_DELAY 400
+
+LedControl lc = LedControl(DIN_PIN, CLK_PIN, CS_PIN, 1);
+Preferences preferences;
+
+enum State { IDLE, DISPENSING, FREEZE_DISPLAY, CONFIG };
+State state = IDLE;
+
+// Variables de monedero y saldo
+volatile int coinPulseCount = 0;
+volatile unsigned long lastCoinPulseTime = 0;
+float saldo = 0.0;
+
+// Tiempos de dispensado
+unsigned long startDispenseTime = 0;
+unsigned long dispenseDuration = 0;
+unsigned long freezeStartTime = 0;
+
+// Animación display
+unsigned long ultimoParpadeo = 0;
+bool pantallaEncendida = true;
+
+// Debounce y botones
+unsigned long lastProdBtnTime = 0;
+unsigned long lastOkTime = 0;
+
+struct Config {
+  int precioP1;
+  long msP1;
+} config;
+
+int configStep = 0; // 0: Precio P1, 1: Tiempo P1
+long configEditValue = 0;
+uint16_t registro595 = 0x0000;
+
+// Declaración de funciones
+void actualizarRegistro595();
+void setBit595(int bit, bool estado);
+void apagarActuadores();
+void controlarLEDs();
+void actualizarPantallas();
+void iniciarDispensado();
+void finalizarDispensado();
+void cargarConfiguracion();
+void guardarConfiguracion();
+void entrarModoConfig();
+void salirModoConfig();
+void manejarConfiguracion();
+void actualizarPantallaConfig();
+void IRAM_ATTR coinISR();
+
+void actualizarRegistro595() {
+  digitalWrite(HC595_ST, LOW);
+  shiftOut(HC595_DS, HC595_SH, MSBFIRST, (uint8_t)(registro595 >> 8));
+  shiftOut(HC595_DS, HC595_SH, MSBFIRST, (uint8_t)(registro595 & 0xFF));
+  digitalWrite(HC595_ST, HIGH);
+}
+
+void setBit595(int bit, bool estado) {
+  if (estado) registro595 |= (1ULL << bit);
+  else        registro595 &= ~(1ULL << bit);
+  actualizarRegistro595();
+}
+
+void apagarActuadores() {
+  digitalWrite(BOMBA_PROD1, LOW);
+  setBit595(Q0_EV_PROD1, false);
+}
+
+void controlarLEDs() {
+  setBit595(Q4_LED_AMBAR, state == DISPENSING);
+  setBit595(Q1_LED_ROJO, false);
+  setBit595(Q3_LED_VERDE, true);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT_MS,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+
+  pinMode(HC595_ST, OUTPUT);
+  pinMode(HC595_SH, OUTPUT);
+  pinMode(HC595_DS, OUTPUT);
+
+  pinMode(COIN_PIN, INPUT_PULLDOWN);
+  pinMode(BTN_PROD1, INPUT_PULLDOWN);
+  pinMode(OK_BTN, INPUT_PULLDOWN);
+  pinMode(ADD_BTN, INPUT_PULLDOWN);
+  pinMode(MINUS_BTN, INPUT_PULLDOWN);
+  pinMode(BOMBA_PROD1, OUTPUT);
+
+  apagarActuadores();
+  controlarLEDs();
+
+  attachInterrupt(digitalPinToInterrupt(COIN_PIN), coinISR, RISING);
+
+  lc.shutdown(0, false);
+  lc.setIntensity(0, 8);
+  lc.clearDisplay(0);
+
+  cargarConfiguracion();
+  actualizarPantallas();
+}
+
+void loop() {
+  esp_task_wdt_reset();
+  unsigned long now = millis();
+
+  // Monedas ingresadas
+  if (state == IDLE && coinPulseCount > 0 && (now - lastCoinPulseTime > 30)) {
+    noInterrupts();
+    int pulses = coinPulseCount;
+    coinPulseCount = 0;
+    interrupts();
+
+    saldo += pulses * 1.0;
+    actualizarPantallas();
+  }
+
+  if (state == CONFIG) {
+    manejarConfiguracion();
+    yield();
+    return;
+  }
+
+  // Selección de Producto
+  if (state == IDLE) {
+    int precio = config.precioP1 / 100;
+    if (digitalRead(BTN_PROD1) == HIGH && (now - lastProdBtnTime > DEBOUNCE_DELAY)) {
+      lastProdBtnTime = now;
+      if (saldo >= precio && precio > 0) {
+        iniciarDispensado();
+      }
+    }
+
+    if (digitalRead(OK_BTN) == HIGH && (now - lastOkTime > DEBOUNCE_DELAY)) {
+      lastOkTime = now;
+      entrarModoConfig();
+    }
+  }
+
+  // Control de Dispensado
+  if (state == DISPENSING) {
+    if (now - startDispenseTime >= dispenseDuration) {
+      apagarActuadores();
+      saldo = 0.0;
+      freezeStartTime = millis();
+      state = FREEZE_DISPLAY;
+    }
+  }
+
+  if (state == FREEZE_DISPLAY) {
+    if (now - freezeStartTime >= 2000) {
+      finalizarDispensado();
+    }
+  }
+
+  controlarLEDs();
+  actualizarPantallas();
+  yield();
+}
+
+void IRAM_ATTR coinISR() {
+  coinPulseCount++;
+  lastCoinPulseTime = millis();
+}
+
+void iniciarDispensado() {
+  dispenseDuration = config.msP1;
+  digitalWrite(BOMBA_PROD1, HIGH);
+  setBit595(Q0_EV_PROD1, true);
+
+  startDispenseTime = millis();
+  state = DISPENSING;
+  controlarLEDs();
+}
+
+void finalizarDispensado() {
+  apagarActuadores();
+  saldo = 0.0;
+  state = IDLE;
+  controlarLEDs();
+  actualizarPantallas();
+}
+
+void actualizarPantallas() {
+  if (state == CONFIG) return;
+
+  // Saldo (D0..D3)
+  int entero = (int)saldo;
+  int decimal = (int)((saldo - entero) * 100);
+  lc.setDigit(0, 0, (entero / 10) % 10, false);
+  lc.setDigit(0, 1, entero % 10, true);
+  lc.setDigit(0, 2, decimal / 10, false);
+  lc.setDigit(0, 3, decimal % 10, false);
+
+  // Tiempo restante (D4..D7)
+  long msRestantes = 0;
+  if (state == DISPENSING) {
+    unsigned long elapsed = millis() - startDispenseTime;
+    if (elapsed < dispenseDuration) msRestantes = dispenseDuration - elapsed;
+  }
+
+  int segs = msRestantes / 1000;
+  int centesimas = (msRestantes % 1000) / 10;
+  lc.setDigit(0, 4, (segs / 10) % 10, false);
+  lc.setDigit(0, 5, segs % 10, true);
+  lc.setDigit(0, 6, centesimas / 10, false);
+  lc.setDigit(0, 7, centesimas % 10, false);
+}
+
+void cargarConfiguracion() {
+  preferences.begin("dispenser", false);
+  config.precioP1 = preferences.getInt("precioP1", 100);
+  config.msP1 = preferences.getLong("msP1", 5000);
+  preferences.end();
+}
+
+void guardarConfiguracion() {
+  preferences.begin("dispenser", false);
+  preferences.putInt("precioP1", config.precioP1);
+  preferences.putLong("msP1", config.msP1);
+  preferences.end();
+}
+
+void entrarModoConfig() {
+  configStep = 0;
+  configEditValue = config.precioP1 / 100;
+  state = CONFIG;
+  actualizarPantallaConfig();
+}
+
+void salirModoConfig() {
+  state = IDLE;
+  controlarLEDs();
+  actualizarPantallas();
+}
+
+void actualizarPantallaConfig() {
+  lc.clearDisplay(0);
+  if (configStep == 0) {
+    // Muestra "Prd1" y el Precio
+    lc.setRow(0, 0, 0b01100111); // P
+    lc.setRow(0, 1, 0b00000101); // r
+    lc.setRow(0, 2, 0b01011110); // d
+    lc.setDigit(0, 3, 1, false);
+
+    lc.setDigit(0, 4, (configEditValue / 10) % 10, false);
+    lc.setDigit(0, 5, configEditValue % 10, true);
+    lc.setDigit(0, 6, 0, false);
+    lc.setDigit(0, 7, 0, false);
+  } else {
+    // Muestra "tPr1" y el Tiempo (ms)
+    lc.setRow(0, 0, 0b00001111); // t
+    lc.setRow(0, 1, 0b01100111); // P
+    lc.setRow(0, 2, 0b00000101); // r
+    lc.setDigit(0, 3, 1, false);
+
+    int segs = configEditValue / 1000;
+    lc.setDigit(0, 4, (segs / 10) % 10, false);
+    lc.setDigit(0, 5, segs % 10, true);
+    lc.setDigit(0, 6, 0, false);
+    lc.setDigit(0, 7, 0, false);
+  }
+}
+
+void manejarConfiguracion() {
+  unsigned long now = millis();
+  bool changed = false;
+
+  if (digitalRead(ADD_BTN) == HIGH && (now - lastProdBtnTime > DEBOUNCE_DELAY)) {
+    lastProdBtnTime = now;
+    if (configStep == 0) configEditValue++;
+    else configEditValue += 1000;
+    changed = true;
+  }
+
+  if (digitalRead(MINUS_BTN) == HIGH && (now - lastProdBtnTime > DEBOUNCE_DELAY)) {
+    lastProdBtnTime = now;
+    if (configStep == 0 && configEditValue > 1) configEditValue--;
+    else if (configStep == 1 && configEditValue > 1000) configEditValue -= 1000;
+    changed = true;
+  }
+
+  if (digitalRead(OK_BTN) == HIGH && (now - lastOkTime > DEBOUNCE_DELAY)) {
+    lastOkTime = now;
+    if (configStep == 0) {
+      config.precioP1 = configEditValue * 100;
+      configStep = 1;
+      configEditValue = config.msP1;
+      changed = true;
+    } else {
+      config.msP1 = configEditValue;
+      guardarConfiguracion();
+      salirModoConfig();
+      return;
+    }
+  }
+
+  if (changed) actualizarPantallaConfig();
+}
